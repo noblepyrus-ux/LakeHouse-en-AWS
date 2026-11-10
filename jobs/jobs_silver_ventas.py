@@ -19,34 +19,29 @@ job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
 print("=" * 60)
-print("JOB SILVER: Bronze -> Silver (Apache Iceberg)")
+print("JOB SILVER: Bronze -> Silver (Apache Iceberg en Spark)")
 print("=" * 60)
 
-# 2. SQL validado previamente en Athena
-# Agregamos DROP TABLE IF EXISTS para que el job sea idempotente
-# (se pueda re-ejecutar sin errores de "tabla ya existe")
+# 2. SQL adaptado a sintaxis NATIVA de Spark (no Athena)
 silver_sql = """
 DROP TABLE IF EXISTS lakehouse_silver_db.sales_silver;
 
 CREATE TABLE lakehouse_silver_db.sales_silver
-WITH (
-    table_type = 'ICEBERG',
-    format = 'PARQUET',
-    location = 's3://lakehouse-andres-2026-silver/sales_silver/',
-    is_external = false
-) AS
+USING iceberg
+LOCATION 's3://lakehouse-andres-2026-silver/sales_silver/'
+AS
 SELECT 
     invoice_id,
     stock_code,
     description,
-    CAST(quantity AS INTEGER) AS quantity,
+    CAST(quantity AS INT) AS quantity,
     CAST(invoice_date AS TIMESTAMP) AS invoice_date,
     CAST(price AS DOUBLE) AS price,
-    CAST(customer_id AS INTEGER) AS customer_id,
+    CAST(customer_id AS INT) AS customer_id,
     TRIM(UPPER(country)) AS country,
     TRIM(UPPER(department)) AS department,
-    CAST(age AS INTEGER) AS age,
-    CAST(CURRENT_TIMESTAMP AS TIMESTAMP) AS processed_at
+    CAST(age AS INT) AS age,
+    CURRENT_TIMESTAMP AS processed_at
 FROM (
     SELECT *,
         ROW_NUMBER() OVER(
