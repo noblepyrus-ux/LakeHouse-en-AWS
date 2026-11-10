@@ -166,3 +166,110 @@ resource "aws_iam_user_policy_attachment" "lakehouse_user_admin" {
   user       = data.aws_iam_user.lakehouse_user.user_name
   policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
 }
+
+# ============================================================
+# GLUE JOBS CONFIGURATION (Scripts & Jobs)
+# ============================================================
+# NOTA: El IAM Role 'glue_service_role' ya fue creado arriba en este archivo.
+# Aquí solo agregamos la política extra, la subida de scripts y los Jobs.
+
+# 1. Política de permisos extra para Glue (Athena, Logs)
+resource "aws_iam_role_policy" "glue_extra_policy" {
+  name = "lakehouse-glue-extra-policy"
+  role = aws_iam_role.glue_service_role.id # Referencia al role que ya existe arriba
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "athena:StartQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:*:*:*"
+      }
+    ]
+  })
+}
+
+# 2. Subir scripts de Python a S3 (para que Glue los ejecute)
+resource "aws_s3_object" "glue_script_staging" {
+  bucket = aws_s3_bucket.temp.id
+  key    = "scripts/job_staging_ventas.py"
+  source = "${path.module}/../jobs/job_staging_ventas.py"
+}
+
+resource "aws_s3_object" "glue_script_silver" {
+  bucket = aws_s3_bucket.temp.id
+  key    = "scripts/jobs_silver_ventas.py"
+  source = "${path.module}/../jobs/jobs_silver_ventas.py"
+}
+
+resource "aws_s3_object" "glue_script_gold" {
+  bucket = aws_s3_bucket.temp.id
+  key    = "scripts/jobs_gold_ventas.py"
+  source = "${path.module}/../jobs/jobs_gold_ventas.py"
+}
+
+# 3. Glue Job 1: Staging (Python Shell)
+resource "aws_glue_job" "staging_job" {
+  name     = "lakehouse-staging-job"
+  role_arn = aws_iam_role.glue_service_role.arn
+  command {
+    name            = "pythonshell"
+    script_location = "s3://${aws_s3_bucket.temp.id}/scripts/job_staging_ventas.py"
+    python_version  = "3.9"
+  }
+  default_arguments = {
+    "--job-language" = "python"
+  }
+  max_capacity = 1  # <-- CORRECCIÓN: Python Shell usa max_capacity, no workers
+  glue_version = "3.0"
+}
+
+# 4. Glue Job 2: Silver (Spark)
+resource "aws_glue_job" "silver_job" {
+  name     = "lakehouse-silver-job"
+  role_arn = aws_iam_role.glue_service_role.arn
+  command {
+    name            = "glueetl"
+    script_location = "s3://${aws_s3_bucket.temp.id}/scripts/jobs_silver_ventas.py"
+    python_version  = "3"
+  }
+  default_arguments = {
+    "--enable-glue-datacatalog" = "true"
+    "--datalake-formats"        = "iceberg"
+    "--job-language"            = "python"
+  }
+  number_of_workers = 2
+  worker_type       = "G.1X"
+  glue_version      = "3.0"
+  max_retries       = 1
+}
+
+# 5. Glue Job 3: Gold (Spark)
+resource "aws_glue_job" "gold_job" {
+  name     = "lakehouse-gold-job"
+  role_arn = aws_iam_role.glue_service_role.arn
+  command {
+    name            = "glueetl"
+    script_location = "s3://${aws_s3_bucket.temp.id}/scripts/jobs_gold_ventas.py"
+    python_version  = "3"
+  }
+  default_arguments = {
+    "--enable-glue-datacatalog" = "true"
+    "--datalake-formats"        = "iceberg"
+    "--job-language"            = "python"
+  }
+  number_of_workers = 2
+  worker_type       = "G.1X"
+  glue_version      = "3.0"
+  max_retries       = 1
+}
