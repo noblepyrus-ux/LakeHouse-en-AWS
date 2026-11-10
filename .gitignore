@@ -1,0 +1,15 @@
+   # Terraform
+   .terraform/
+   *.tfstate
+   *.tfstate.backup
+   *.tfvars
+   
+   # Python
+   __pycache__/
+   *.pyc
+   venv/
+   
+   # Datos crudos 
+   data/*.csv
+   data/*.json
+   data/*.parquet
