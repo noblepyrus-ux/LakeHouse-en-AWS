@@ -218,20 +218,24 @@ resource "aws_s3_object" "glue_script_gold" {
   source = "${path.module}/../jobs/jobs_gold_ventas.py"
 }
 
-# 3. Glue Job 1: Staging (Python Shell)
+# 3. Glue Job 1: Staging (Spark - CSV -> Parquet)
 resource "aws_glue_job" "staging_job" {
   name     = "lakehouse-staging-job"
   role_arn = aws_iam_role.glue_service_role.arn
   command {
-    name            = "pythonshell"
+    name            = "glueetl"
     script_location = "s3://${aws_s3_bucket.temp.id}/scripts/job_staging_ventas.py"
-    python_version  = "3.9"
+    python_version  = "3"
   }
   default_arguments = {
-    "--job-language" = "python"
+    "--enable-glue-datacatalog" = "true"
+    "--datalake-formats"        = "parquet"
+    "--job-language"            = "python"
   }
-  max_capacity = 1  # <-- CORRECCIÓN: Python Shell usa max_capacity, no workers
-  glue_version = "3.0"
+  number_of_workers = 2
+  worker_type       = "G.1X"
+  glue_version      = "3.0"
+  max_retries       = 1
 }
 
 # 4. Glue Job 2: Silver (Spark)

@@ -31,7 +31,7 @@ print("      ✓ BD creada con location válida")
 
 # 2. Leer Parquet DIRECTO desde S3 (ignora catálogo, ignora particiones)
 print("[2/5] Leyendo Parquet desde S3...")
-df_bronze = spark.read.parquet("s3://lakehouse-andres-2026-landing/ecommerce_raw/")
+df_bronze = spark.table("lakehouse_bronze_db.ecommerce_bronze")
 total_bronze = df_bronze.count()
 print(f"      Filas leídas: {total_bronze}")
 

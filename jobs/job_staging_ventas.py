@@ -1,61 +1,73 @@
 """
-JOB STAGING: Convierte CSV de Landing a Parquet en Bronze
-Tipo: Python Shell (Glue)
-Entrada: S3 lakehouse-andres-2026-landing/raw_data.csv
-Salida:  S3 lakehouse-andres-2026-bronze/bronze_data.parquet
+JOB STAGING: CSV -> Parquet (Landing -> Bronze)
+Tipo: Spark (Glue) | Formato: Parquet
+Entrada: S3 ecommerce_raw/ (CSV crudo)
+Salida:  lakehouse_bronze_db.ecommerce_bronze (Parquet en Glue Catalog)
 """
 import sys
-import os
-import boto3
-import pandas as pd
-from io import BytesIO
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
 
-# Agregar helpers al path (Glue Python Shell lo permite)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from helpers.s3_data_wrangling import (
-    read_csv_from_s3,
-    write_parquet_to_s3,
-    validate_schema,
-    clean_column_names
-)
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
 
-# Configuración
-LANDING_BUCKET = 'lakehouse-andres-2026-landing'
-LANDING_KEY = 'raw_data.csv'
-BRONZE_BUCKET = 'lakehouse-andres-2026-bronze'
-BRONZE_KEY = 'bronze_data.parquet'
+print("=" * 60)
+print("JOB STAGING: CSV -> Parquet (Landing -> Bronze)")
+print("=" * 60)
 
-REQUIRED_COLUMNS = ['invoice_id', 'stock_code', 'description', 
-                    'quantity', 'invoice_date', 'price', 
-                    'customer_id', 'country', 'department', 'age']
+# 1. Crear BD Bronze con location explícita
+print("[1/4] Creando base de datos Bronze...")
+spark.sql("""
+    CREATE DATABASE IF NOT EXISTS lakehouse_bronze_db
+    LOCATION 's3://lakehouse-andres-2026-bronze/'
+""")
+print("      ✓ BD Bronze lista")
 
-def main():
-    print("=" * 60)
-    print("JOB STAGING: CSV -> Parquet (Bronze)")
-    print("=" * 60)
-    
-    # 1. Leer CSV desde S3
-    print(f"[1/4] Leyendo CSV desde s3://{LANDING_BUCKET}/{LANDING_KEY}...")
-    df = read_csv_from_s3(LANDING_BUCKET, LANDING_KEY)
-    print(f"      Filas leídas: {len(df)}")
-    
-    # 2. Limpiar nombres de columnas
-    print("[2/4] Limpiando nombres de columnas...")
-    df = clean_column_names(df)
-    
-    # 3. Validar schema
-    print("[3/4] Validando schema...")
-    validate_schema(df, REQUIRED_COLUMNS)
-    print("      Schema válido ✓")
-    
-    # 4. Escribir Parquet en Bronze
-    print(f"[4/4] Escribiendo Parquet en s3://{BRONZE_BUCKET}/{BRONZE_KEY}...")
-    write_parquet_to_s3(df, BRONZE_BUCKET, BRONZE_KEY)
-    print(f"      {len(df)} filas escritas ✓")
-    
-    print("=" * 60)
-    print("JOB STAGING completado exitosamente")
-    print("=" * 60)
+# 2. Leer CSV crudo DIRECTO desde S3
+print("[2/4] Leyendo CSV desde S3 (ecommerce_raw/)...")
+df_crudo = spark.read.option("header", "true").csv("s3://lakehouse-andres-2026-landing/ecommerce_raw/")
+total_crudo = df_crudo.count()
+print(f"      Filas leídas: {total_crudo}")
 
-if __name__ == '__main__':
-    main()
+# 3. Escribir Parquet en S3 (Bronze)
+print("[3/4] Escribiendo Parquet en S3 (ecommerce_bronze/)...")
+output_path = "s3://lakehouse-andres-2026-bronze/ecommerce_bronze"
+df_crudo.write.mode("overwrite").parquet(output_path)
+print(f"      ✓ Datos escritos en {output_path}")
+
+# 4. Registrar tabla con schema EXPLÍCITO (no infiere nada)
+print("[4/4] Registrando tabla en Glue Catalog con schema explícito...")
+spark.sql("DROP TABLE IF EXISTS lakehouse_bronze_db.ecommerce_bronze")
+spark.sql("""
+    CREATE TABLE lakehouse_bronze_db.ecommerce_bronze (
+        invoice_id     STRING,
+        stock_code     STRING,
+        description    STRING,
+        quantity       STRING,
+        invoice_date   STRING,
+        price          STRING,
+        customer_id    STRING,
+        country        STRING,
+        department     STRING,
+        age            STRING
+    )
+    STORED AS PARQUET
+    LOCATION 's3://lakehouse-andres-2026-bronze/ecommerce_bronze'
+""")
+print("      ✓ Tabla Bronze registrada en catálogo")
+
+# Verificación
+count = spark.sql("SELECT COUNT(*) as total FROM lakehouse_bronze_db.ecommerce_bronze").collect()[0]["total"]
+print(f"      ✓ Verificación: {count} filas en tabla Bronze")
+
+print("=" * 60)
+print("JOB STAGING completado exitosamente (CSV -> Parquet)")
+print("=" * 60)
+
+job.commit()
