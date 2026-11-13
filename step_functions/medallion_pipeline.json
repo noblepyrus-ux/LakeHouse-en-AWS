@@ -1,0 +1,31 @@
+
+{
+  "Comment": "Automated Medallion Pipeline: Staging -> Silver -> Gold",
+  "StartAt": "Staging Job",
+  "States": {
+    "Staging Job": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "lakehouse-staging-job"
+      },
+      "Next": "Silver Job"
+    },
+    "Silver Job": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "lakehouse-silver-job"
+      },
+      "Next": "Gold Job"
+    },
+    "Gold Job": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "lakehouse-gold-job"
+      },
+      "End": true
+    }
+  }
+}

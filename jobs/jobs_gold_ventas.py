@@ -1,164 +1,310 @@
 """
-JOB GOLD: Modelo Estrella Puro (Silver -> Gold)
-Tipo: Spark (Glue) | Formato: Parquet (patrón ganador del Silver)
-Entrada: S3 sales_silver/ (Parquet de Silver)
-Salida:  lakehouse_gold_db (1 Fact + 5 Dims en Parquet)
+AWS Glue Job: Silver to Gold
+
+Runtime: AWS Glue 4.0
+Source: lakehouse_silver_db.sales_silver
+Target: lakehouse_gold_db
+Format: Apache Parquet
+Data Model:
+    dim_date
+    dim_product
+    dim_customer
+    dim_department
+    dim_country
+    fact_sales
 """
 import sys
+import logging
 from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from pyspark.sql.functions import col, current_timestamp
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
 
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
+SILVER_TABLE = "lakehouse_silver_db.sales_silver"
+GOLD_DATABASE = "lakehouse_gold_db"
+GOLD_BUCKET = "s3://lakehouse-andres-2026-gold"
+GOLD_TABLES = [
+    "dim_date",
+    "dim_product",
+    "dim_customer",
+    "dim_department",
+    "dim_country",
+    "fact_sales",
+]
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-print("=" * 60)
-print("JOB GOLD: Silver -> Modelo Estrella (Parquet)")
-print("=" * 60)
+def initialize_gold_database(spark):
+    """Create the Gold database if it does not exist."""
+    spark.sql(
+        f"""
+        CREATE DATABASE IF NOT EXISTS {GOLD_DATABASE}
+        LOCATION '{GOLD_BUCKET}/'
+        """
+    )
+def validate_silver_data(dataframe):
+    """Validate the Silver schema and required values."""
+    required_columns = {
+        "invoice_id",
+        "stock_code",
+        "description",
+        "quantity",
+        "invoice_date",
+        "price",
+        "customer_id",
+        "country",
+        "department",
+        "age",
+    }
+    missing_columns = sorted(
+        required_columns - set(dataframe.columns)
+    )
+    if missing_columns:
+        raise ValueError(
+            f"Missing Silver columns: {missing_columns}"
+        )
+    invalid_records = dataframe.filter(
+        F.col("invoice_id").isNull()
+        | (F.trim(F.col("invoice_id")) == "")
+        | F.col("stock_code").isNull()
+        | (F.trim(F.col("stock_code")) == "")
+        | F.col("invoice_date").isNull()
+        | F.col("quantity").isNull()
+        | (F.col("quantity") == 0)
+        | F.col("price").isNull()
+    )
+    if invalid_records.limit(1).count() > 0:
+        raise ValueError(
+            "Silver contains records with missing required values"
+        )
+def add_audit_columns(dataframe):
+    """Add processing timestamps to the dataset."""
+    return (
+        dataframe
+        .withColumn("created_at", F.current_timestamp())
+        .withColumn("updated_at", F.current_timestamp())
+    )
 
-# Helper: aplica el patrón ganador a cada tabla (write + register con schema explícito)
-def register_table(table_name, path, df, schema_sql):
-    df.write.mode("overwrite").parquet(path)
-    spark.sql(f"DROP TABLE IF EXISTS lakehouse_gold_db.{table_name}")
-    spark.sql(f"""
-        CREATE TABLE lakehouse_gold_db.{table_name} ({schema_sql})
-        STORED AS PARQUET
-        LOCATION '{path}'
-    """)
-    print(f"      ✓ {table_name} creada y registrada")
+def create_date_dimension(sales):
+    """Create a date dimension from available sales dates."""
+    dates = (
+        sales
+        .select(
+            F.to_date("invoice_date").alias("full_date")
+        )
+        .filter(F.col("full_date").isNotNull())
+        .distinct()
+    )
 
-# 1. BD Gold con location explícita
-print("[1/8] Creando base de datos Gold...")
-spark.sql("""
-    CREATE DATABASE IF NOT EXISTS lakehouse_gold_db
-    LOCATION 's3://lakehouse-andres-2026-gold/'
-""")
-print("      ✓ BD Gold lista")
+    result = dates.select(
+        F.date_format("full_date", "yyyyMMdd")
+        .cast("int")
+        .alias("date_key"),
+        "full_date",
+        F.year("full_date").alias("year"),
+        F.quarter("full_date").alias("quarter"),
+        F.month("full_date").alias("month"),
+        F.date_format("full_date", "MMMM")
+        .alias("month_name"),
+        F.dayofmonth("full_date")
+        .alias("day_of_month"),
+        F.dayofweek("full_date")
+        .alias("day_of_week"),
+        F.date_format("full_date", "EEEE")
+        .alias("day_name"),
+        F.dayofweek("full_date")
+        .isin(1, 7)
+        .alias("is_weekend"),
+        F.weekofyear("full_date")
+        .alias("week_of_year"),
+    )
+    return add_audit_columns(result)
+    
+def create_product_dimension(sales):
+    """Create one product record per stock code."""
+    result = (
+        sales
+        .filter(
+            F.col("stock_code").isNotNull()
+            & (F.col("stock_code") != "")
+        )
+        .groupBy("stock_code")
+        .agg(
+            F.min("description").alias("description"),
+            F.min("department").alias("department"),
+        )
+    )
+    return add_audit_columns(result)
+    
+def create_customer_dimension(sales):
+    """Create one customer record per customer identifier."""
+    result = (
+        sales
+        .filter(F.col("customer_id").isNotNull())
+        .groupBy("customer_id")
+        .agg(F.max("age").alias("age"))
+    )
+    return add_audit_columns(result)
+    
+def create_department_dimension(sales):
+    """Create the department dimension."""
+    result = (
+        sales
+        .select("department")
+        .filter(
+            F.col("department").isNotNull()
+            & (F.col("department") != "")
+        )
+        .distinct()
+    )
+    return add_audit_columns(result)
 
-# 2. Leer Silver directo de S3 y crear vista
-print("[2/8] Leyendo Silver desde S3...")
-df_silver = spark.read.parquet("s3://lakehouse-andres-2026-silver/sales_silver")
-df_silver.createOrReplaceTempView("silver_view")
-print(f"      Filas Silver: {df_silver.count()}")
+def create_country_dimension(sales):
+    """Create the country dimension."""
 
-# 3. DIM_DATE (generada por rango de fechas)
-print("[3/8] Generando DIM_DATE...")
-df_dim_date = spark.sql("""
-    SELECT
-        CAST(year(d)*10000 + month(d)*100 + day(d) AS INT) AS date_key,
-        d AS full_date,
-        year(d) AS year,
-        quarter(d) AS quarter,
-        month(d) AS month,
-        date_format(d, 'MMMM') AS month_name,
-        day(d) AS day_of_month,
-        dayofweek(d) AS day_of_week,
-        date_format(d, 'EEEE') AS day_name,
-        CASE WHEN dayofweek(d) IN (1,7) THEN true ELSE false END AS is_weekend,
-        false AS is_holiday,
-        weekofyear(d) AS week_of_year,
-        current_timestamp() AS created_at,
-        current_timestamp() AS updated_at
-    FROM (SELECT explode(sequence(to_date('2024-01-01'), to_date('2027-12-31'), interval 1 day)) AS d)
-""")
-register_table("dim_date", "s3://lakehouse-andres-2026-gold/dim_date", df_dim_date, """
-    date_key INT, full_date DATE, year INT, quarter INT, month INT,
-    month_name STRING, day_of_month INT, day_of_week INT, day_name STRING,
-    is_weekend BOOLEAN, is_holiday BOOLEAN, week_of_year INT,
-    created_at TIMESTAMP, updated_at TIMESTAMP
-""")
+    result = (
+        sales
+        .select("country")
+        .filter(
+            F.col("country").isNotNull()
+            & (F.col("country") != "")
+        )
+        .distinct()
+    )
+    return add_audit_columns(result)
+    
+def create_sales_fact(sales):
+    """Create the sales fact table."""
+    result = sales.select(
+        F.col("invoice_id"),
+        F.col("stock_code"),
+        F.col("customer_id"),
+        F.date_format(
+            "invoice_date", "yyyyMMdd"
+        ).cast("int").alias("date_key"),
+        F.col("department"),
+        F.col("country"),
+        F.col("quantity").cast("int"),
+        F.col("price")
+        .cast("decimal(18, 2)")
+        .alias("unit_price"),
+        (
+            F.col("quantity").cast("decimal(18, 0)")
+            * F.col("price").cast("decimal(18, 2)")
+        ).cast("decimal(28, 2)").alias("revenue"),
+    )
+    return add_audit_columns(result)
+    
+def register_gold_table(spark, table_name, dataframe):
+    """Write a Gold dataset and register its external table."""
+    table_path = f"{GOLD_BUCKET}/{table_name}"
+    full_table_name = f"{GOLD_DATABASE}.{table_name}"
+    logger.info("Writing Gold table: %s", table_name)
+    (
+        dataframe.write
+        .mode("overwrite")
+        .parquet(table_path)
+    )
+    spark.sql(f"DROP TABLE IF EXISTS {full_table_name}")
+    schema_definition = ",\n".join(
+        f"`{field.name}` {field.dataType.simpleString()}"
+        for field in dataframe.schema.fields
+    )
+    spark.sql(
+    f"""
+    CREATE TABLE {full_table_name} (
+        {schema_definition}
+    )
+    USING PARQUET
+    LOCATION '{table_path}'
+    """
+    )
+    logger.info("Registered Gold table: %s", full_table_name)
 
-# 4. DIM_PRODUCT
-print("[4/8] Generando DIM_PRODUCT...")
-df_dim_product = spark.sql("""
-    SELECT stock_code, description, department,
-        current_timestamp() AS created_at, current_timestamp() AS updated_at
-    FROM silver_view GROUP BY stock_code, description, department
-""")
-register_table("dim_product", "s3://lakehouse-andres-2026-gold/dim_product", df_dim_product, """
-    stock_code STRING, description STRING, department STRING,
-    created_at TIMESTAMP, updated_at TIMESTAMP
-""")
+def validate_gold_tables(spark, expected_fact_count):
+    """Validate the registered Gold tables."""
+    for table_name in GOLD_TABLES:
+        full_name = f"{GOLD_DATABASE}.{table_name}"
+        record_count = spark.table(full_name).count()
+        logger.info(
+            "Gold table %s contains %s records",
+            table_name,
+            record_count
+        )
+        if record_count == 0:
+            raise RuntimeError(
+                f"Gold table {table_name} is empty"
+            )
+        if (
+            table_name == "fact_sales"
+            and record_count != expected_fact_count
+        ):
+            raise RuntimeError(
+                "Gold fact record count does not match Silver"
+            )
+def validate_dimension_keys(spark):
+    """Validate uniqueness of Gold dimension keys."""
+    dimensions = {
+        "dim_date": "date_key",
+        "dim_product": "stock_code",
+        "dim_customer": "customer_id",
+        "dim_department": "department",
+        "dim_country": "country",
+    }
+    for table_name, key_column in dimensions.items():
+        dataframe = spark.table(
+            f"{GOLD_DATABASE}.{table_name}"
+        )
+        duplicate_keys = (
+            dataframe.groupBy(key_column)
+            .count()
+            .filter(F.col("count") > 1)
+        )
+        if duplicate_keys.limit(1).count() > 0:
+            raise ValueError(
+                f"Duplicate keys found in {table_name}"
+            )
+        logger.info(
+            "Dimension key validation passed: %s",
+            table_name
+        )
+def main():
+    """Execute the Silver to Gold ETL job."""
+    args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+    spark_context = SparkContext.getOrCreate()
+    glue_context = GlueContext(spark_context)
+    spark = glue_context.spark_session
+    job = Job(glue_context)
+    job.init(args["JOB_NAME"], args)
+    logger.info("Starting Silver to Gold job")
+    initialize_gold_database(spark)
+    silver_data = spark.table(SILVER_TABLE)
+    silver_count = silver_data.count()
+    if silver_count == 0:
+        raise ValueError("The Silver dataset is empty")
+    validate_silver_data(silver_data)
+    logger.info("Silver records: %s", silver_count)
+    gold_datasets = {
+        "dim_date": create_date_dimension(silver_data),
+        "dim_product": create_product_dimension(silver_data),
+        "dim_customer": create_customer_dimension(silver_data),
+        "dim_department": create_department_dimension(silver_data),
+        "dim_country": create_country_dimension(silver_data),
+        "fact_sales": create_sales_fact(silver_data),
+    }
 
-# 5. DIM_CUSTOMER
-print("[5/8] Generando DIM_CUSTOMER...")
-df_dim_customer = spark.sql("""
-    SELECT customer_id, age,
-        current_timestamp() AS created_at, current_timestamp() AS updated_at
-    FROM silver_view GROUP BY customer_id, age
-""")
-register_table("dim_customer", "s3://lakehouse-andres-2026-gold/dim_customer", df_dim_customer, """
-    customer_id INT, age INT,
-    created_at TIMESTAMP, updated_at TIMESTAMP
-""")
+    for table_name in GOLD_TABLES:
+        register_gold_table(
+            spark,
+            table_name,
+            gold_datasets[table_name]
+        )
+    validate_gold_tables(spark, silver_count)
+    validate_dimension_keys(spark)
 
-# 6. DIM_DEPARTMENT
-print("[6/8] Generando DIM_DEPARTMENT...")
-df_dim_dept = spark.sql("""
-    SELECT department,
-        current_timestamp() AS created_at, current_timestamp() AS updated_at
-    FROM silver_view WHERE department IS NOT NULL AND department != ''
-    GROUP BY department
-""")
-register_table("dim_department", "s3://lakehouse-andres-2026-gold/dim_department", df_dim_dept, """
-    department STRING,
-    created_at TIMESTAMP, updated_at TIMESTAMP
-""")
+    logger.info("Silver to Gold job completed successfully")
 
-# 7. DIM_COUNTRY
-print("[7/8] Generando DIM_COUNTRY...")
-df_dim_country = spark.sql("""
-    SELECT country,
-        current_timestamp() AS created_at, current_timestamp() AS updated_at
-    FROM silver_view WHERE country IS NOT NULL AND country != ''
-    GROUP BY country
-""")
-register_table("dim_country", "s3://lakehouse-andres-2026-gold/dim_country", df_dim_country, """
-    country STRING,
-    created_at TIMESTAMP, updated_at TIMESTAMP
-""")
-
-# 8. FACT_SALES (la joya de la corona)
-print("[8/8] Generando FACT_SALES...")
-df_fact = spark.sql("""
-    SELECT
-        invoice_id,
-        stock_code,
-        customer_id,
-        CAST(year(invoice_date)*10000 + month(invoice_date)*100 + day(invoice_date) AS INT) AS date_key,
-        department,
-        country,
-        quantity,
-        price AS unit_price,
-        CAST(quantity AS DOUBLE) * price AS revenue,
-        current_timestamp() AS created_at,
-        current_timestamp() AS updated_at
-    FROM silver_view
-    WHERE invoice_id IS NOT NULL AND invoice_id != ''
-""")
-register_table("fact_sales", "s3://lakehouse-andres-2026-gold/fact_sales", df_fact, """
-    invoice_id STRING, stock_code STRING, customer_id INT, date_key INT,
-    department STRING, country STRING, quantity INT,
-    unit_price DOUBLE, revenue DOUBLE,
-    created_at TIMESTAMP, updated_at TIMESTAMP
-""")
-
-# Verificación final
-print("=" * 60)
-print("VERIFICACIÓN DEL MODELO ESTRELLA")
-print("=" * 60)
-for t in ["dim_date","dim_product","dim_customer","dim_department","dim_country","fact_sales"]:
-    c = spark.sql(f"SELECT COUNT(*) AS n FROM lakehouse_gold_db.{t}").collect()[0]["n"]
-    print(f"  {t:15s} -> {c} filas")
-
-print("=" * 60)
-print("JOB GOLD completado exitosamente (Modelo Estrella Parquet)")
-print("=" * 60)
-
-job.commit()
+    job.commit()
+if __name__ == "__main__":
+    main()
