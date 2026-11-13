@@ -1,69 +1,40 @@
-"""
-JOB SILVER: Limpieza, deduplicación y tipado de datos (Bronze -> Silver)
-Tipo: Spark (Glue)
-Entrada: lakehouse_bronze_db.lakehouse_andres_2026_landing
-Salida:  lakehouse_silver_db.sales_silver (Apache Iceberg)
-"""
-import sys
-from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
-from awsglue.context import GlueContext
-from awsglue.job import Job
+-- ==========================================
+-- FASE 05: CREAR CAPA SILVER (ICEBERG)
+-- Transformación: Bronze → Silver
+-- Limpieza: Eliminar duplicados, corregir tipos, auditoría
+-- ==========================================
 
-# 1. Inicializar contexto Glue y Spark
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
+-- 1. Crear la base de datos para la capa Silver
+CREATE DATABASE IF NOT EXISTS lakehouse_silver_db;
 
-print("=" * 60)
-print("JOB SILVER: Bronze -> Silver (Apache Iceberg en Spark)")
-print("=" * 60)
-
-# 2. SQL adaptado a sintaxis NATIVA de Spark (no Athena)
-silver_sql = """
-DROP TABLE IF EXISTS lakehouse_silver_db.sales_silver;
-
+-- 2. Crear la tabla Silver en formato Apache Iceberg con datos limpios
 CREATE TABLE lakehouse_silver_db.sales_silver
-USING iceberg
-LOCATION 's3://lakehouse-andres-2026-silver/sales_silver/'
-AS
+WITH (
+    table_type = 'ICEBERG',
+    format = 'PARQUET',
+    location = 's3://lakehouse-andres-2026-silver/sales_silver/'
+) AS
 SELECT 
     invoice_id,
     stock_code,
     description,
-    CAST(quantity AS INT) AS quantity,
+    CAST(quantity AS INTEGER) AS quantity,
     CAST(invoice_date AS TIMESTAMP) AS invoice_date,
     CAST(price AS DOUBLE) AS price,
-    CAST(customer_id AS INT) AS customer_id,
+    CAST(customer_id AS INTEGER) AS customer_id,
     TRIM(UPPER(country)) AS country,
     TRIM(UPPER(department)) AS department,
-    CAST(age AS INT) AS age,
+    CAST(age AS INTEGER) AS age,
     CURRENT_TIMESTAMP AS processed_at
 FROM (
     SELECT *,
         ROW_NUMBER() OVER(
             PARTITION BY invoice_id, stock_code, invoice_date 
             ORDER BY invoice_date DESC
-        ) AS rn
+        ) as rn
     FROM lakehouse_bronze_db.lakehouse_andres_2026_landing
     WHERE invoice_id IS NOT NULL 
       AND invoice_id != ''
       AND quantity != 0
 )
-WHERE rn = 1
-"""
-
-# 3. Ejecutar la transformación
-print("[1/2] Ejecutando query de transformación en Spark...")
-spark.sql(silver_sql)
-print("[2/2] Tabla Silver creada/actualizada exitosamente en Iceberg.")
-
-print("=" * 60)
-print("JOB SILVER completado exitosamente")
-print("=" * 60)
-
-# 4. Finalizar job
-job.commit()
+WHERE rn = 1;

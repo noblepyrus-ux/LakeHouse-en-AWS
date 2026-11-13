@@ -277,3 +277,146 @@ resource "aws_glue_job" "gold_job" {
   glue_version      = "3.0"
   max_retries       = 1
 }
+
+# ============================================================
+# 7. ORQUESTADOR: STEP FUNCTIONS + EVENTBRIDGE
+# ============================================================
+
+# 1. IAM Role para Step Functions
+resource "aws_iam_role" "sfn_role" {
+  name = "lakehouse-sfn-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "states.amazonaws.com"
+      }
+    }]
+  })
+}
+
+# 2. Política de permisos para Step Functions (controlar Glue y Logs)
+resource "aws_iam_role_policy" "sfn_policy" {
+  name = "lakehouse-sfn-policy"
+  role = aws_iam_role.sfn_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:BatchStopJobRun"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogDelivery", "logs:GetLogDelivery", "logs:UpdateLogDelivery",
+          "logs:DeleteLogDelivery", "logs:ListLogDeliveries", "logs:PutResourcePolicy",
+          "logs:DescribeResourcePolicies", "logs:DescribeLogGroups"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# 3. Definición de la Máquina de Estados (El cerebro del pipeline)
+# Nota: El sufijo ".sync" es mágico: espera a que el Glue Job termine antes de pasar al siguiente.
+resource "aws_sfn_state_machine" "lakehouse_pipeline" {
+  name     = "lakehouse-medallion-pipeline"
+  role_arn = aws_iam_role.sfn_role.arn
+
+  definition = jsonencode({
+    Comment = "Automated Medallion Pipeline: Staging -> Silver -> Gold"
+    StartAt = "Staging Job"
+    States = {
+      "Staging Job" = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
+        Parameters = {
+          JobName = "lakehouse-staging-job"
+        }
+        Next = "Silver Job"
+      }
+      "Silver Job" = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
+        Parameters = {
+          JobName = "lakehouse-silver-job"
+        }
+        Next = "Gold Job"
+      }
+      "Gold Job" = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::glue:startJobRun.sync"
+        Parameters = {
+          JobName = "lakehouse-gold-job"
+        }
+        End = true
+      }
+    }
+  })
+}
+
+# 4. EventBridge Rule (Trigger por evento S3: cuando cae un archivo nuevo en landing)
+resource "aws_cloudwatch_event_rule" "pipeline_schedule" {
+  name        = "lakehouse-pipeline-s3-trigger"
+  description = "Dispara el pipeline cuando llega un archivo CSV nuevo a landing/ecommerce_raw/"
+
+  event_pattern = jsonencode({
+    source      = ["aws.s3"]
+    detail-type = ["Object Created"]
+    detail = {
+      bucket = {
+        name = ["lakehouse-andres-2026-landing"]
+      }
+      object = {
+        key = [{ "prefix": "ecommerce_raw/" }]
+      }
+    }
+  })
+}
+
+# 5. IAM Role para que EventBridge pueda disparar Step Functions
+resource "aws_iam_role" "eventbridge_sfn_role" {
+  name = "lakehouse-eb-sfn-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "events.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "eventbridge_sfn_policy" {
+  name = "lakehouse-eb-sfn-policy"
+  role = aws_iam_role.eventbridge_sfn_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "states:StartExecution"
+      Resource = aws_sfn_state_machine.lakehouse_pipeline.arn
+    }]
+  })
+}
+
+# 6. Conectar el Trigger con la Máquina de Estados
+resource "aws_cloudwatch_event_target" "sfn_target" {
+  rule      = aws_cloudwatch_event_rule.pipeline_schedule.name
+  target_id = "lakehouse-sfn-target"
+  arn       = aws_sfn_state_machine.lakehouse_pipeline.arn
+  role_arn  = aws_iam_role.eventbridge_sfn_role.arn
+}
